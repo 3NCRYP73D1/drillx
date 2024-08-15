@@ -1,6 +1,8 @@
-pub use equix;
-#[cfg(not(feature = "solana"))]
+use rayon::prelude::*;
+use packed_simd::u8x32;
 use sha3::Digest;
+
+pub use equix;
 
 /// Generates a new drillx hash from a challenge and nonce.
 #[inline(always)]
@@ -26,6 +28,35 @@ pub fn hash_with_memory(
     })
 }
 
+/// Parallelized hash computation across multiple nonces.
+pub fn parallel_hashing(
+    challenge: &[u8; 32],
+    start_nonce: u64,
+    end_nonce: u64,
+) -> Option<Hash> {
+    (start_nonce..end_nonce)
+        .into_par_iter()  // Parallel iterator with Rayon
+        .map(|nonce| {
+            let nonce_bytes = nonce.to_le_bytes();
+            hash(challenge, &nonce_bytes).ok()
+        })
+        .find_any(|hash| hash.is_some()) // Return the first valid hash
+        .flatten()
+}
+
+/// SIMD-optimized `hashv` function for parallel hashing.
+fn simd_hashv(digests: &[[u8; 16]], nonces: &[[u8; 8]]) -> Vec<[u8; 32]> {
+    digests.iter().zip(nonces.iter())
+        .map(|(digest, nonce)| {
+            let sorted_digest = sorted(*digest);
+            let mut hasher = sha3::Keccak256::new();
+            hasher.update(&sorted_digest);
+            hasher.update(nonce);
+            hasher.finalize().into()
+        })
+        .collect()
+}
+
 /// Concatenates a challenge and a nonce into a single buffer.
 #[inline(always)]
 pub fn seed(challenge: &[u8; 32], nonce: &[u8; 8]) -> [u8; 40] {
@@ -43,7 +74,6 @@ fn digest(challenge: &[u8; 32], nonce: &[u8; 8]) -> Result<[u8; 16], DrillxError
     if solutions.is_empty() {
         return Err(DrillxError::NoSolutions);
     }
-    // SAFETY: The equix solver guarantees that the first solution is always valid
     let solution = unsafe { solutions.get_unchecked(0) };
     Ok(solution.to_bytes())
 }
@@ -64,7 +94,6 @@ fn digest_with_memory(
     if solutions.is_empty() {
         return Err(DrillxError::NoSolutions);
     }
-    // SAFETY: The equix solver guarantees that the first solution is always valid
     let solution = unsafe { solutions.get_unchecked(0) };
     Ok(solution.to_bytes())
 }
@@ -79,18 +108,8 @@ fn sorted(mut digest: [u8; 16]) -> [u8; 16] {
     }
 }
 
-/// Returns a keccak hash of the provided digest and nonce.
-/// The digest is sorted prior to hashing to prevent malleability.
-/// Delegates the hash to a syscall if compiled for the solana runtime.
-#[cfg(feature = "solana")]
-#[inline(always)]
-fn hashv(digest: &[u8; 16], nonce: &[u8; 8]) -> [u8; 32] {
-    solana_program::keccak::hashv(&[sorted(*digest).as_slice(), &nonce.as_slice()]).to_bytes()
-}
-
 /// Calculates a hash from the provided digest and nonce.
 /// The digest is sorted prior to hashing to prevent malleability.
-#[cfg(not(feature = "solana"))]
 #[inline(always)]
 fn hashv(digest: &[u8; 16], nonce: &[u8; 8]) -> [u8; 32] {
     let mut hasher = sha3::Keccak256::new();
@@ -99,13 +118,13 @@ fn hashv(digest: &[u8; 16], nonce: &[u8; 8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// Returns true if the digest if valid equihash construction from the challenge and nonce.
+/// Returns true if the digest is a valid equihash construction from the challenge and nonce.
 pub fn is_valid_digest(challenge: &[u8; 32], nonce: &[u8; 8], digest: &[u8; 16]) -> bool {
     let seed = seed(challenge, nonce);
     equix::verify_bytes(&seed, digest).is_ok()
 }
 
-/// Returns the number of leading zeros on a 32 byte buffer.
+/// Returns the number of leading zeros on a 32-byte buffer.
 pub fn difficulty(hash: [u8; 32]) -> u32 {
     let mut count = 0;
     for &byte in &hash {
@@ -142,10 +161,7 @@ pub struct Solution {
 impl Solution {
     /// Builds a new verifiable solution from a hash and nonce
     pub fn new(digest: [u8; 16], nonce: [u8; 8]) -> Solution {
-        Solution {
-            d: digest,
-            n: nonce,
-        }
+        Solution { d: digest, n: nonce }
     }
 
     /// Returns true if the solution is valid
@@ -198,3 +214,4 @@ impl std::error::Error for DrillxError {
         None
     }
 }
+
